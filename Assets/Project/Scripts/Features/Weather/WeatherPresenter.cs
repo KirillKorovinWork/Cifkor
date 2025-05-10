@@ -1,51 +1,92 @@
 using System;
 using System.Threading;
 using Cysharp.Threading.Tasks;
+using UnityEngine;
+using UnityEngine.Networking;
 using Zenject;
 
 public class WeatherPresenter : IInitializable, IDisposable
 {
-    private readonly IWeatherView _view;
-    private readonly IRequestQueue _queue;
-    private readonly WeatherRequest _request = new();
-    private CancellationTokenSource _cts;
+    readonly IWeatherView _view;
+    CancellationTokenSource _cts;
 
-    [Inject]
-    public WeatherPresenter(IWeatherView view, IRequestQueue queue)
-    {
-        _view = view;
-        _queue = queue;
-    }
+    [Inject] public WeatherPresenter(IWeatherView view) => _view = view;
 
     public void Initialize()
     {
         _view.OnBecameVisible += StartUpdates;
+
+        if ((_view as MonoBehaviour)?.isActiveAndEnabled == true)
+            StartUpdates();
     }
 
-    private void StartUpdates()
+
+    void StartUpdates()
     {
+        _view.OnBecameInvisible -= StopUpdates;
         _view.OnBecameInvisible += StopUpdates;
+
+        _cts?.Dispose();
         _cts = new CancellationTokenSource();
         Loop(_cts.Token).Forget();
     }
 
-    private async UniTaskVoid Loop(CancellationToken ct)
+    async UniTaskVoid Loop(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
-            _queue.Enqueue(_request);
+            await UpdateWeather(ct);
             await UniTask.Delay(TimeSpan.FromSeconds(5), cancellationToken: ct);
         }
     }
 
-    private void StopUpdates()
+    async UniTask UpdateWeather(CancellationToken ct)
+    {
+        _view.ShowLoading();
+
+        const string url = "https://api.weather.gov/gridpoints/TOP/32,81/forecast";
+        using var uwr = UnityWebRequest.Get(url);
+        await uwr.SendWebRequest().WithCancellation(ct);
+        if (uwr.result != UnityWebRequest.Result.Success) return;
+
+        var root = JsonUtility.FromJson<Root>(uwr.downloadHandler.text);
+        var p = root.properties.periods[0];
+        int temp = p.temperature;
+        string iconUrl = p.icon;
+
+        Sprite sprite = null;
+        using (var texReq = UnityWebRequestTexture.GetTexture(iconUrl))
+        {
+            await texReq.SendWebRequest().WithCancellation(ct);
+            if (texReq.result == UnityWebRequest.Result.Success)
+            {
+                var tex = DownloadHandlerTexture.GetContent(texReq);
+                var rect = new Rect(0, 0, tex.width, tex.height);
+                sprite = Sprite.Create(tex, rect, new Vector2(0.5f, 0.5f));
+            }
+        }
+
+        _view.SetData(sprite, $"Сегодня: {temp} °F");
+    }
+
+    [Serializable] class Root { public Props properties; }
+    [Serializable] class Props { public Period[] periods; }
+    [Serializable]
+    class Period
+    {
+        public int temperature;
+        public string icon;
+    }
+
+    void StopUpdates()
     {
         _view.OnBecameInvisible -= StopUpdates;
-        _cts.Cancel();
-        _cts.Dispose();
-        _cts = null;
-        _queue.CancelActive(typeof(WeatherRequest));
-        _queue.Cancel(typeof(WeatherRequest));
+        if (_cts != null)
+        {
+            if (!_cts.IsCancellationRequested) _cts.Cancel();
+            _cts.Dispose();
+            _cts = null;
+        }
     }
 
     public void Dispose()
@@ -53,8 +94,9 @@ public class WeatherPresenter : IInitializable, IDisposable
         _view.OnBecameVisible -= StartUpdates;
         if (_cts != null)
         {
-            _cts.Cancel();
+            if (!_cts.IsCancellationRequested) _cts.Cancel();
             _cts.Dispose();
+            _cts = null;
         }
     }
 }
